@@ -1,9 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.utils.parametrize as parameterize
-from transformers import GPT2TokenizerFast
-
-from tiny_lm import model as tiny_model
 
 
 # For nn.MultiHeadAttention, the following holds:
@@ -11,7 +7,7 @@ from tiny_lm import model as tiny_model
 
 # Weight matrix used for TinyLM's MultiHeadAttention modules
 # are saved in self.in_proj_weight which is (3*embed_dim, embed_dim) for Q,K,V as they use the same input tensor.
-# -> Add the spectral decomposition for self.in_proj_weight -> B = (768,2), A = (2, 768)
+# -> Add the spectral decomposition for self.in_proj_weight -> B = (EMBED_DIM, RANK), A = (RANK, EMBED_DIM)
 
 class AttentionLoRA(nn.Module):
 
@@ -68,7 +64,7 @@ class AttentionLoRA(nn.Module):
         # Shape: (EMBED_DIM * 3, EMBED_DIM)
         merged_weights = attention_weights_det + merged_ba * self.scaling
         # Update the modified parameters
-        setattr(self.module, self.target_parameter, nn.Parameter(merged_weights, requires_grad=False))
+        setattr(self.module, self.target_parameter, nn.Parameter(merged_weights))
 
     def _un_merge_weights(self):
         target_weights = self.module.get_parameter(self.target_parameter)
@@ -112,11 +108,9 @@ def inject_lora(module: nn.Module, target_layers: list[str], rank: int, alpha: f
 
         setattr(current_mod, target, lora)
 
-
 # EXAMPLE USAGE:
 # 1. LOAD MODEL
 # test_model.load_state_dict(torch.load('tiny_lm/tiny_lm_weights')['model_state_dict'])
 # 2. INJECT LORA LAYERS AND FREEZE ORIGINAL WEIGHTS
 # inject_lora(test_model, ["self_attention"], 2, 0.1, test_model.device)
 # 3. Train on fine-tune dataset.
-
