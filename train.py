@@ -1,5 +1,7 @@
 import os.path
+from datetime import datetime
 
+import lora
 import wandb
 
 import torch
@@ -9,6 +11,14 @@ import model
 from transformers import GPT2TokenizerFast
 from torch.utils import data
 import numpy as np
+
+"""
+Trains a small language model that can learn to speak englisch with very few parameters 
+using the TinyStories Dataset.
+
+For Fine-Tuning, you can either use full-weights fine-tuning (just resume training and change the dataset
+location) or use low-rank adapters to greatly reduce the amount of trainable parameters (faster fine-tuning).
+"""
 
 tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
 
@@ -59,31 +69,6 @@ class TinyStoriesDataset(data.IterableDataset):
         return len(self.train)
 
 
-# ----------------------------------------- SETUP ----------------------------------------------------------------------
-# ----------------------------------------------------------------------------------------------------------------------
-
-config = {
-    "BLOCK_SIZE": 128,
-    "EMB_SIZE": 768,
-    "N_ATTENTION_HEADS": 4,
-    "N_DECODER_BLOCKS": 2,
-    "VOCAB_SIZE": len(tokenizer),
-    "MAX_OUT_TOKENS": 200,
-    "EVAL_INTERVAL": 1000,
-    "EVAL_ITER": 100,
-    "LR": 3e-4,
-    "BATCH_SIZE": 32,
-    "DEVICE": 'cuda' if torch.cuda.is_available() else 'cpu'
-}
-assert config['EMB_SIZE'] % config['N_ATTENTION_HEADS'] == 0
-
-wandb.init(
-    project='TinyLM',
-    config=config
-)
-text_table = wandb.Table(columns=['epoch', 'loss', 'predicted text'])
-
-
 @torch.no_grad()
 def eval_model(training_model: torch.nn.Module, val_loader: torch.utils.data.DataLoader):
     training_model.eval()
@@ -109,18 +94,67 @@ def generate_sample_text(training_model: model.TinyLM, max_tokens: int = 200) ->
     return tokenizer.decode(out_tokens)
 
 
+# ----------------------------------------- SETUP ----------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------------------------
+
+config = {
+    "BLOCK_SIZE": 128,
+    "EMB_SIZE": 768,
+    "N_ATTENTION_HEADS": 4,
+    "N_DECODER_BLOCKS": 2,
+    "VOCAB_SIZE": len(tokenizer),
+    "MAX_OUT_TOKENS": 200,
+    "EVAL_INTERVAL": 1000,
+    "EVAL_ITER": 100,
+    "LR": 3e-4,
+    "BATCH_SIZE": 32,
+    "DEVICE": 'cuda' if torch.cuda.is_available() else 'cpu',
+    "LOAD_PATH": 'models/tiny_base.pt',
+    "SAVE_PATH": 'models/tiny_base_lora.pt',
+    "ENABLE_LORA": True,
+}
+assert config['EMB_SIZE'] % config['N_ATTENTION_HEADS'] == 0
+prev_epochs = 0
+
+# Create model instance
 print(f"Loading model on device {config['DEVICE']}")
 model = model.TinyLM(emb_dim=config['EMB_SIZE'], block_size=config['BLOCK_SIZE'],
                      n_att_heads=config['N_ATTENTION_HEADS'], n_decoders=config['N_DECODER_BLOCKS'],
                      vocab_size=config['VOCAB_SIZE'], device=config['DEVICE'])
-optim = torch.optim.Adam(model.parameters(), lr=config['LR'])
-if os.path.exists('models/tiny_lm'):
-    checkpoint = torch.load('models/tiny_lm')
-    print(f"Loading model from checkpoint, continuing training after {checkpoint['b_idx']} episodes ...")
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optim.load_state_dict(checkpoint['optimizer_state_dict'])
+
 model = model.to(config['DEVICE'])
+
+lora_enabled_on_base = False
+checkpoint = None
+# Load pre-trained base model if it exists
+if os.path.exists(config['LOAD_PATH']):
+    checkpoint = torch.load(config['LOAD_PATH'], map_location=config['DEVICE'])
+    prev_epochs = checkpoint['epoch']
+    lora_enabled_on_base = checkpoint['lora_was_enabled']
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+
+# INJECT LoRA, if enabled AND not already enabled in the base weights
+# IF lora was in the base weights, there is no need to create the layers again, as they already exist!
+# --> Training will just continue to train the LoRA layers.
+should_inject_lora = config['ENABLE_LORA'] and not lora_enabled_on_base
+if should_inject_lora:
+    lora.inject_lora(model, ["self_attention"], 2, 0.1, config['DEVICE'])
+
+# Get trainable parameters
+trainable_parameters = [p for p in model.parameters() if p.requires_grad]
+total_params = sum(p.numel() for p in trainable_parameters)
+print(f"\nTotal trainable parameters: {total_params}")
+
+# Initialize optimizer
+optim = torch.optim.Adam(trainable_parameters, lr=config['LR'])
+# Load the state of the optimizer only if training is continued with the same structure.
+if checkpoint and not should_inject_lora:
+    optim.load_state_dict(checkpoint['optimizer_state_dict'])
+
 loss_fn = torch.nn.CrossEntropyLoss()
+
+# DATASET
 # ----------------------------------------------------------------------------------------------------------------------
 TINY_STORY_TRAIN = 'data/TinyStories-train.txt'
 TINY_TOKENIZED = 'data/tiny_tokenized.npy'
@@ -141,6 +175,14 @@ val_tiny_stories = TinyStoriesDataset(TINY_TOKENIZED_VAL, config['BLOCK_SIZE'], 
 val_loader = data.DataLoader(val_tiny_stories, batch_size=config['BATCH_SIZE'])
 # ----------------------------------------------------------------------------------------------------------------------
 # ----------------------------------------- TRAINING -------------------------------------------------------------------
+
+# SETUP Wands & Biases for eval logging
+wandb.init(
+    project='TinyLM',
+    config=config
+)
+text_table = wandb.Table(columns=['epoch', 'loss', 'predicted text'])
+
 try:
     for b_idx, batch in enumerate(train_loader):
         # Inference
@@ -163,7 +205,14 @@ try:
 except KeyboardInterrupt:
     pass
 finally:
-    torch.save({'epoch': b_idx,
+    checkpoint_location = config['LOAD_PATH']
+    if config['SAVE_PATH']:
+        checkpoint_location = config['SAVE_PATH']
+
+    print(f"Saving model to {checkpoint_location} and shutting down training...")
+    torch.save({'epoch': prev_epochs + b_idx,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optim.state_dict()
-                }, 'models/tiny_lm')
+                'optimizer_state_dict': optim.state_dict(),
+                'lora_was_enabled': config['ENABLE_LORA'],
+                'config': config,
+                }, checkpoint_location)
