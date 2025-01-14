@@ -1,6 +1,5 @@
 import os.path
-from datetime import datetime
-
+import time
 import lora
 import wandb
 
@@ -96,7 +95,7 @@ def generate_sample_text(training_model: model.TinyLM, max_tokens: int = 200) ->
 
 # ----------------------------------------- SETUP ----------------------------------------------------------------------
 # ----------------------------------------------------------------------------------------------------------------------
-
+DEBUG_INFO = True
 config = {
     "BLOCK_SIZE": 128,
     "EMB_SIZE": 768,
@@ -110,8 +109,8 @@ config = {
     "BATCH_SIZE": 32,
     "DEVICE": 'cuda' if torch.cuda.is_available() else 'cpu',
     "LOAD_PATH": 'models/tiny_base.pt',
-    "SAVE_PATH": 'models/tiny_base_lora.pt',
-    "ENABLE_LORA": True,
+    "SAVE_PATH": 'models/tiny_base.pt',
+    "ENABLE_LORA": False,
 }
 assert config['EMB_SIZE'] % config['N_ATTENTION_HEADS'] == 0
 prev_epochs = 0
@@ -185,17 +184,25 @@ text_table = wandb.Table(columns=['epoch', 'loss', 'predicted text'])
 
 try:
     for b_idx, batch in enumerate(train_loader):
-        # Inference
-        sources, targets = batch
-        logits = model(sources)
-        logits = logits.view(config['BATCH_SIZE'] * config['BLOCK_SIZE'], config['VOCAB_SIZE'])
-        targets = targets.view(config['BATCH_SIZE'] * config['BLOCK_SIZE'])
-        loss = torch.nn.functional.cross_entropy(logits, targets)
+        start = time.time()
+        optim.zero_grad()
+
+        # Enable autocasting for the forward pass
+        with torch.autocast(device_type=config['DEVICE']):
+            # Inference
+            sources, targets = batch
+            logits = model(sources)
+            logits = logits.view(config['BATCH_SIZE'] * config['BLOCK_SIZE'], config['VOCAB_SIZE'])
+            targets = targets.view(config['BATCH_SIZE'] * config['BLOCK_SIZE'])
+            loss = torch.nn.functional.cross_entropy(logits, targets)
         wandb.log({"loss": loss})
         # Weight update
-        optim.zero_grad()
         loss.backward()
         optim.step()
+
+        end = time.time()
+        print(f"Batch {b_idx} || Inf: {end - start:.6f}sec | Loss: {loss}")
+
 
         if b_idx % config['EVAL_INTERVAL'] == 0:
             val_loss = eval_model(model, val_loader)
