@@ -1,4 +1,6 @@
+import inspect
 import os.path
+import platform
 import time
 import lora
 import wandb
@@ -132,7 +134,6 @@ if os.path.exists(config['LOAD_PATH']):
     lora_enabled_on_base = checkpoint['lora_was_enabled']
     model.load_state_dict(checkpoint['model_state_dict'])
 
-
 # INJECT LoRA, if enabled AND not already enabled in the base weights
 # IF lora was in the base weights, there is no need to create the layers again, as they already exist!
 # --> Training will just continue to train the LoRA layers.
@@ -146,7 +147,9 @@ total_params = sum(p.numel() for p in trainable_parameters)
 print(f"\nTotal trainable parameters: {total_params}")
 
 # Initialize optimizer
-optim = torch.optim.Adam(trainable_parameters, lr=config['LR'])
+fused_adam_available = ('fused' in inspect.signature(torch.optim.AdamW).parameters) and 'cuda' in config['DEVICE']
+print(f"Using fused AdamW: {fused_adam_available}")
+optim = torch.optim.AdamW(trainable_parameters, lr=config['LR'], fused=fused_adam_available)
 # Load the state of the optimizer only if training is continued with the same structure.
 if checkpoint and not should_inject_lora:
     optim.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -182,6 +185,11 @@ wandb.init(
 )
 text_table = wandb.Table(columns=['epoch', 'loss', 'predicted text'])
 
+# Compile model to achieve Kernel Fusion in all parts but the Self-Attention
+if platform.system() == 'Windows':
+    print("Can not compile model on Windows! Using eager model ...")
+else:
+    model = torch.compile(model)
 try:
     for b_idx, batch in enumerate(train_loader):
         start = time.time()
@@ -198,11 +206,14 @@ try:
         wandb.log({"loss": loss})
         # Weight update
         loss.backward()
+        # Clip gradients to avoid really high loss and gradients due to bad data batch.
+        norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
         optim.step()
 
         end = time.time()
-        print(f"Batch {b_idx} || Inf: {end - start:.6f}sec | Loss: {loss}")
-
+        time_diff = end - start
+        wandb.log({"loss": loss, "time_per_batch": time_diff, "clip_norm": norm.item()})
+        print(f"Batch {b_idx} || Inf: {time_diff:.6f}sec | Loss: {loss}")
 
         if b_idx % config['EVAL_INTERVAL'] == 0:
             val_loss = eval_model(model, val_loader)
